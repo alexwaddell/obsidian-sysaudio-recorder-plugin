@@ -18,8 +18,17 @@ interface AudioRecorderSettings {
   recordMicrophone: boolean;
   selectedMicrophoneId: string;
   muteHotkey: string; // Global hotkey for mute toggle
-  outputFormat: "webm" | "wav";
+  outputFormat: "webm" | "wav" | "mp4";
 }
+
+// Candidate MediaRecorder mimeTypes for each output format, in preference
+// order. The first one MediaRecorder.isTypeSupported() accepts is used.
+const MIME_TYPE_CANDIDATES: Record<"webm" | "mp4", string[]> = {
+  webm: ["audio/webm;codecs=opus", "audio/webm"],
+  // MP4 audio recording via MediaRecorder requires Chromium 126+
+  // (Electron versions shipped with recent Obsidian all qualify).
+  mp4: ["audio/mp4;codecs=mp4a.40.2", "audio/mp4"],
+};
 
 const DEFAULT_SETTINGS: AudioRecorderSettings = {
   recordingsFolder: "Recordings",
@@ -42,11 +51,14 @@ export default class AudioRecorderPlugin extends Plugin {
   statusBarItem: HTMLElement | null = null;
   activeFileAtStart: TFile | null = null;
   controlWindow: any = null; // BrowserWindow
-  processorNode: ScriptProcessorNode | null = null;
-  muteGainNode: GainNode | null = null;
-  animationIntervalId: NodeJS.Timeout | null = null;
+  visualizationIntervalId: number | null = null;
   electron: any = null; // Electron reference
   startTime: number = 0;
+  // The mimeType/extension actually used for the current recording. May
+  // differ from settings.outputFormat if the preferred format wasn't
+  // supported by MediaRecorder and we fell back to WebM.
+  activeRecordingMimeType: string = "audio/webm";
+  activeOutputExtension: "webm" | "wav" | "mp4" = "webm";
 
   // Audio properties
   sampleRate: number = 44100;
@@ -93,6 +105,8 @@ export default class AudioRecorderPlugin extends Plugin {
 
   onunload() {
     this.stopRecording();
+    this.stopRecordingStreams();
+    this.closeControlWindow();
     this.unregisterGlobalHotkey();
   }
 
@@ -131,6 +145,7 @@ export default class AudioRecorderPlugin extends Plugin {
 
 
   async startRecording() {
+    let hotkeyRegistered = false;
     try {
       this.activeFileAtStart = this.app.workspace.getActiveFile();
 
@@ -150,9 +165,6 @@ export default class AudioRecorderPlugin extends Plugin {
         new Notice("Error: desktopCapturer API is not available.");
         return;
       }
-
-      // Register global hotkey for mute toggle
-      this.registerGlobalHotkey();
 
       // Auto-select the first screen (Primary Display)
       const sources = await desktopCapturer.getSources({ types: ["screen"] });
@@ -253,11 +265,21 @@ export default class AudioRecorderPlugin extends Plugin {
         return;
       }
 
-      // Always use MediaRecorder (WebM) for recording
-      // If WAV is selected, we'll convert it after recording stops
-      this.recorder = new MediaRecorder(finalStream, {
-        mimeType: "audio/webm",
-      });
+      // WAV is produced by decoding a WebM recording afterward. MP4 and
+      // WebM are both recorded natively by MediaRecorder - pick whichever
+      // mimeType is actually supported, falling back to WebM if the
+      // requested format isn't available (e.g. MP4 on an older Electron).
+      const nativeFormat = this.settings.outputFormat === "wav" ? "webm" : this.settings.outputFormat;
+      const mimeType = this.pickSupportedMimeType(nativeFormat);
+      if (nativeFormat === "mp4" && !mimeType.startsWith("audio/mp4")) {
+        new Notice("MP4 recording isn't supported on this system. Falling back to WebM.");
+      }
+      this.activeRecordingMimeType = mimeType;
+      this.activeOutputExtension = this.settings.outputFormat === "wav"
+        ? "wav"
+        : (mimeType.startsWith("audio/mp4") ? "mp4" : "webm");
+
+      this.recorder = new MediaRecorder(finalStream, { mimeType });
       this.chunks = [];
 
       this.recorder.ondataavailable = (e) => {
@@ -267,16 +289,16 @@ export default class AudioRecorderPlugin extends Plugin {
       };
 
       this.recorder.onstop = async () => {
-        const webmBlob = new Blob(this.chunks, { type: "audio/webm" });
+        const recordedBlob = new Blob(this.chunks, { type: this.activeRecordingMimeType });
 
         let finalBlob: Blob;
         if (this.settings.outputFormat === "wav") {
           // Convert WebM to WAV
           new Notice("Converting to WAV...");
-          finalBlob = await this.convertWebMToWAV(webmBlob);
+          finalBlob = await this.convertWebMToWAV(recordedBlob);
         } else {
-          // Keep as WebM
-          finalBlob = webmBlob;
+          // Keep as recorded (WebM or MP4)
+          finalBlob = recordedBlob;
         }
 
         await this.saveRecording(finalBlob);
@@ -288,6 +310,12 @@ export default class AudioRecorderPlugin extends Plugin {
 
       this.recorder.start();
 
+      // Register the global mute hotkey only once we actually have an
+      // active recording, so a failed/aborted start doesn't leave a
+      // system-wide shortcut registered with nothing to unregister it.
+      this.registerGlobalHotkey();
+      hotkeyRegistered = true;
+
       this.startTime = Date.now();
       this.statusBarItem?.setText("Recording...");
       new Notice("Recording started.");
@@ -298,6 +326,9 @@ export default class AudioRecorderPlugin extends Plugin {
     } catch (err) {
       console.error("Error starting recording:", err);
       new Notice("Failed to start recording. See console for details.");
+      if (hotkeyRegistered) {
+        this.unregisterGlobalHotkey();
+      }
       this.stopRecordingStreams();
     }
   }
@@ -379,41 +410,27 @@ export default class AudioRecorderPlugin extends Plugin {
       this.controlWindow = null;
     }
 
-    if (this.processorNode) {
-      this.processorNode.disconnect();
-      this.processorNode = null;
-    }
-
-    if (this.muteGainNode) {
-      this.muteGainNode.disconnect();
-      this.muteGainNode = null;
-    }
+    this.stopAudioVisualization();
   }
 
   startAudioVisualization() {
-    if (!this.analyserNode || !this.controlWindow || !this.audioContext) return;
+    if (!this.analyserNode || !this.controlWindow) return;
 
-    const dataArray = new Uint8Array(this.analyserNode.frequencyBinCount);
+    // AnalyserNode.getByteFrequencyData() works as long as its input is
+    // connected, even with nothing connected to its output. Polling it on
+    // an interval avoids running an extra ScriptProcessorNode (deprecated,
+    // runs on the main thread) and an unnecessary connection back into
+    // audioContext.destination just to read levels.
+    const analyser = this.analyserNode;
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
 
-    this.processorNode = this.audioContext.createScriptProcessor(2048, 1, 1);
-
-    this.muteGainNode = this.audioContext.createGain();
-    this.muteGainNode.gain.value = 0;
-
-    this.analyserNode.connect(this.processorNode);
-    this.processorNode.connect(this.muteGainNode);
-    this.muteGainNode.connect(this.audioContext.destination);
-
-    this.processorNode.onaudioprocess = () => {
-      if (!this.analyserNode || !this.controlWindow) {
-        if (this.processorNode) {
-          this.processorNode.disconnect();
-          this.processorNode = null;
-        }
+    this.visualizationIntervalId = window.setInterval(() => {
+      if (!this.controlWindow || this.controlWindow.isDestroyed()) {
+        this.stopAudioVisualization();
         return;
       }
 
-      this.analyserNode.getByteFrequencyData(dataArray);
+      analyser.getByteFrequencyData(dataArray);
 
       let sum = 0;
       for (let i = 0; i < dataArray.length; i++) {
@@ -422,13 +439,18 @@ export default class AudioRecorderPlugin extends Plugin {
       const average = sum / dataArray.length / 255;
 
       try {
-        if (!this.controlWindow.isDestroyed()) {
-          this.controlWindow.webContents.send("audio-level", average);
-        }
+        this.controlWindow.webContents.send("audio-level", average);
       } catch (err) {
         // Window might be closed
       }
-    };
+    }, 50);
+  }
+
+  stopAudioVisualization() {
+    if (this.visualizationIntervalId !== null) {
+      window.clearInterval(this.visualizationIntervalId);
+      this.visualizationIntervalId = null;
+    }
   }
 
   async stopRecording() {
@@ -453,28 +475,24 @@ export default class AudioRecorderPlugin extends Plugin {
       channels.push(audioBuffer.getChannelData(i));
     }
 
-    // Interleave channels
-    let interleaved: Float32Array;
-    if (this.numChannels === 2) {
-      interleaved = this.interleave(channels[0], channels[1]);
-    } else if (this.numChannels === 1) {
-      // Mono - duplicate to stereo for consistency
-      interleaved = this.interleave(channels[0], channels[0]);
+    // Mono gets duplicated to stereo; more than 2 channels get mixed down
+    // to stereo (left = channel 0, right = last available channel).
+    let left: Float32Array;
+    let right: Float32Array;
+    if (this.numChannels === 1) {
+      left = channels[0];
+      right = channels[0];
       this.numChannels = 2;
     } else {
-      // More than 2 channels - mix down to stereo
-      const left = new Float32Array(audioBuffer.length);
-      const right = new Float32Array(audioBuffer.length);
-      for (let i = 0; i < audioBuffer.length; i++) {
-        left[i] = channels[0][i];
-        right[i] = channels[Math.min(1, channels.length - 1)][i];
-      }
-      interleaved = this.interleave(left, right);
+      left = channels[0];
+      right = channels[Math.min(1, channels.length - 1)];
       this.numChannels = 2;
     }
 
-    // Create WAV file
-    const wavData = this.writeWavHeader(interleaved);
+    // Create WAV file. Writes directly from the per-channel arrays instead
+    // of first allocating a full interleaved Float32Array copy, which for
+    // long recordings avoids doubling peak memory usage.
+    const wavData = this.writeWavFile(left, right);
     return new Blob([wavData], { type: "audio/wav" });
   }
 
@@ -488,15 +506,9 @@ export default class AudioRecorderPlugin extends Plugin {
       this.micStream = null;
     }
 
-    if (this.processorNode) {
-      this.processorNode.disconnect();
-      this.processorNode = null;
-    }
-
-    if (this.muteGainNode) {
-      this.muteGainNode.disconnect();
-      this.muteGainNode = null;
-    }
+    this.stopAudioVisualization();
+    this.analyserNode = null;
+    this.micGainNode = null;
 
     if (this.audioContext) {
       this.audioContext.close();
@@ -549,7 +561,10 @@ export default class AudioRecorderPlugin extends Plugin {
   async saveRecording(blob: Blob) {
     let buffer: Uint8Array;
 
-    if (this.settings.outputFormat === "webm") {
+    // Chromium's WebM muxer doesn't write a duration into the container,
+    // so fix-webm-duration patches it in afterward. MP4 recordings don't
+    // have this issue and WAV has an explicit header written by us.
+    if (this.activeOutputExtension === "webm") {
       const duration = Date.now() - this.startTime;
       const fixedBlob = await new Promise<Blob>((resolve) => {
         fixWebmDuration(blob, duration, (fixed: Blob) => {
@@ -570,7 +585,7 @@ export default class AudioRecorderPlugin extends Plugin {
 
     const now = new Date();
     const timestamp = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, "0")}-${now.getDate().toString().padStart(2, "0")} ${now.getHours().toString().padStart(2, "0")}.${now.getMinutes().toString().padStart(2, "0")}.${now.getSeconds().toString().padStart(2, "0")}`;
-    const extension = this.settings.outputFormat;
+    const extension = this.activeOutputExtension;
     const filename = `${folderPath}/Recording ${timestamp}.${extension}`;
 
     // @ts-ignore
@@ -582,6 +597,25 @@ export default class AudioRecorderPlugin extends Plugin {
     }
   }
 
+  // Returns the first MediaRecorder-supported mimeType for the requested
+  // format, falling back to WebM if none of the format's candidates (or
+  // the format itself) are supported.
+  pickSupportedMimeType(format: "webm" | "mp4"): string {
+    const candidates = MIME_TYPE_CANDIDATES[format];
+    const supported = candidates.find((type) => MediaRecorder.isTypeSupported(type));
+    if (supported) return supported;
+
+    if (format !== "webm") {
+      const webmFallback = MIME_TYPE_CANDIDATES.webm.find((type) =>
+        MediaRecorder.isTypeSupported(type),
+      );
+      if (webmFallback) return webmFallback;
+    }
+
+    // Last resort: let the browser pick its own default.
+    return "audio/webm";
+  }
+
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
   }
@@ -590,35 +624,13 @@ export default class AudioRecorderPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
-  interleave(leftChannel: Float32Array, rightChannel: Float32Array) {
-    const length = leftChannel.length + rightChannel.length;
-    const result = new Float32Array(length);
-
-    let inputIndex = 0;
-
-    for (let index = 0; index < length;) {
-      result[index++] = leftChannel[inputIndex];
-      result[index++] = rightChannel[inputIndex];
-      inputIndex++;
-    }
-    return result;
-  }
-
-  convertFloat32ToInt16(buffer: Float32Array) {
-    let l = buffer.length;
-    const buf = new Int16Array(l);
-    while (l--) {
-      buf[l] = Math.min(1, Math.max(-1, buffer[l])) * 0x7fff;
-    }
-    return buf;
-  }
-
-  writeWavHeader(samples: Float32Array) {
-    const buffer = new ArrayBuffer(44 + samples.length * 2);
+  writeWavFile(left: Float32Array, right: Float32Array) {
+    const frameCount = left.length;
+    const buffer = new ArrayBuffer(44 + frameCount * 4);
     const view = new DataView(buffer);
 
     this.writeString(view, 0, "RIFF");
-    view.setUint32(4, 36 + samples.length * 2, true);
+    view.setUint32(4, 36 + frameCount * 4, true);
     this.writeString(view, 8, "WAVE");
     this.writeString(view, 12, "fmt ");
     view.setUint32(16, 16, true);
@@ -629,18 +641,20 @@ export default class AudioRecorderPlugin extends Plugin {
     view.setUint16(32, this.numChannels * 2, true);
     view.setUint16(34, 16, true);
     this.writeString(view, 36, "data");
-    view.setUint32(40, samples.length * 2, true);
+    view.setUint32(40, frameCount * 4, true);
 
-    this.floatTo16BitPCM(view, 44, samples);
+    let offset = 44;
+    for (let i = 0; i < frameCount; i++) {
+      const l = Math.max(-1, Math.min(1, left[i]));
+      view.setInt16(offset, l < 0 ? l * 0x8000 : l * 0x7fff, true);
+      offset += 2;
+
+      const r = Math.max(-1, Math.min(1, right[i]));
+      view.setInt16(offset, r < 0 ? r * 0x8000 : r * 0x7fff, true);
+      offset += 2;
+    }
 
     return view;
-  }
-
-  floatTo16BitPCM(output: DataView, offset: number, input: Float32Array) {
-    for (let i = 0; i < input.length; i++, offset += 2) {
-      const s = Math.max(-1, Math.min(1, input[i]));
-      output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-    }
   }
 
   writeString(view: DataView, offset: number, string: string) {
@@ -718,8 +732,9 @@ class AudioRecorderSettingTab extends PluginSettingTab {
         dropdown
           .addOption("webm", "WebM")
           .addOption("wav", "WAV")
+          .addOption("mp4", "MP4 (M4A)")
           .setValue(this.plugin.settings.outputFormat)
-          .onChange(async (value: "webm" | "wav") => {
+          .onChange(async (value: "webm" | "wav" | "mp4") => {
             this.plugin.settings.outputFormat = value;
             await this.plugin.saveSettings();
           });
