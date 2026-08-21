@@ -24,7 +24,7 @@ Record system and microphone audio directly in Obsidian with an elegant, always-
 
 ### Seamless Note Integration
 - Recordings automatically embed into the note that was active when the recording was started
-- Saved as WebM or WAV audio files
+- Saved as WebM, WAV, or MP4 (M4A/AAC) audio files
 - Customizable recordings folder
 
 # How to use
@@ -36,21 +36,22 @@ Record system and microphone audio directly in Obsidian with an elegant, always-
 
 # Settings
 | Setting            | Description                                                              |
-|--------------------|--------------------------------------------------------------------------|
+| ------------------ | ------------------------------------------------------------------------ |
 | Recordings Folder  | Where to save your audio files                                           |
 | Record Microphone  | Toggle microphone to be completely on/off (on by default)                |
 | Microphone Source  | Select which microphone to use (will default to your system default mic) |
-| Output Format      | Select the output format (WebM or WAV)                                   |  
+| Output Format      | Select the output format (WebM, WAV, or MP4)                             |
 | Global Mute Hotkey | System-wide shortcut for muting (e.g., `CommandOrControl+Shift+M`)       |
 
 # Requirements
 - Desktop Only
 - Obsidian v0.15.0 or higher
 - Windows recommended for system audio (macOS may require additional setup / has not been tested)
+- MP4 output requires an Electron/Chromium version with native MediaRecorder MP4 support (Chromium 126+, i.e. any current Obsidian release). If unsupported, recordings automatically fall back to WebM.
 
 # Installation
 ### Manual Installation
-1. Download `obsidian-sysaudio-recorder.zip` from the latest release [here](https://github.com/codyklr/obsidian-sysaudio-recorder-plugin/releases)
+1. Download `obsidian-sysaudio-recorder.zip` from the latest release [here](https://github.com/alexwaddell/obsidian-sysaudio-recorder-plugin/releases)
 2. Extract the zip file
 3. Move the `obsidian-sysaudio-recorder` folder inside the extracted folder to `<your-vault>/.obsidian/plugins/`
 4. Restart Obsidian (or reload plugins)
